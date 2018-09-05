@@ -2,16 +2,17 @@ package app
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"sync"
 
-	"github.com/Jeffail/gabs"
 	"github.com/Sirupsen/logrus"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 
 	pvController "github.com/kubernetes-incubator/external-storage/lib/controller"
 	appsv1beta2 "k8s.io/api/apps/v1beta2"
+	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -232,7 +233,7 @@ func deployFlexvolumeDriver(kubeClient *clientset.Clientset, c *cli.Context, man
 		var err error
 		flexvolumeDir, err = discoverFlexvolumeDir(kubeClient)
 		if err != nil {
-			logrus.Warnf("Failed to detect flexvolume dir, fall back to default: ", err)
+			logrus.Warnf("Failed to detect flexvolume dir, fall back to default: %v", err)
 		}
 		if flexvolumeDir == "" {
 			flexvolumeDir = DefaultFlexvolumeDir
@@ -371,29 +372,134 @@ func getFlexvolumeDaemonSetSpec(image, flexvolumeDir string) *appsv1beta2.Daemon
 }
 
 func discoverFlexvolumeDir(kubeClient *clientset.Clientset) (dir string, err error) {
+	flexvolumeDir := ""
+
+	namespace := os.Getenv(types.EnvPodNamespace)
+	if namespace == "" {
+		return "", fmt.Errorf("Cannot detect pod namespace, environment variable %v is missing", types.EnvPodNamespace)
+	}
+	serverPort := int32(8080)
+	objectMeta := metav1.ObjectMeta{
+		Name: "discover-flexvolume-dir",
+	}
+
+	// start server to receive results
+	doneChan := make(chan struct{})
+	s := &http.Server{
+		Addr: fmt.Sprintf(":%d", serverPort),
+	}
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		logrus.Infof("Discovered FlexVolume dir path: %s", r.URL.Path)
+		flexvolumeDir = r.URL.Path
+		close(doneChan)
+	})
+	go s.ListenAndServe()
+
+	// before returning, shutdown server and delete k8s resources
 	defer func() {
-		err = errors.Wrap(err, "cannot discover Flexvolume Dir")
+		var wg sync.WaitGroup
+
+		notify := func(f func()) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				f()
+			}()
+		}
+		notify(func() {
+			s.Shutdown(nil)
+		})
+		notify(func() {
+			kubeClient.CoreV1().Services(namespace).Delete(objectMeta.Name, nil)
+		})
+		notify(func() {
+			deletePolicyForeground := metav1.DeletePropagationBackground
+			kubeClient.BatchV1().Jobs(namespace).Delete(objectMeta.Name, &metav1.DeleteOptions{
+				PropagationPolicy: &deletePolicyForeground,
+			})
+		})
+
+		wg.Wait()
 	}()
-	nodeName, err := util.GetRequiredEnv(types.EnvNodeName)
+
+	// create self-targeting service
+	kubeClient.CoreV1().Services(namespace).Create(&v1.Service{
+		ObjectMeta: objectMeta,
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				v1.ServicePort{
+					Name: "longhorn-driver-deployer",
+					Port: serverPort,
+				},
+			},
+			Selector: map[string]string{
+				"app": "longhorn-driver-deployer",
+			},
+			Type: v1.ServiceTypeClusterIP,
+		},
+	})
+
+	// create job that will send results to our server
+	privilege := true
+	_, err = kubeClient.BatchV1().Jobs(namespace).Create(&batchv1.Job{
+		ObjectMeta: objectMeta,
+		Spec: batchv1.JobSpec{
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: objectMeta,
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						v1.Container{
+							Name:    objectMeta.Name,
+							Image:   "busybox",
+							Command: []string{"/bin/sh"},
+							Args: []string{"-c",
+								`
+								find_kubelet_proc() {
+									for proc in $(find /proc -type d -maxdepth 1); do
+										if [ ! -f $proc/cmdline ]; then
+											continue
+										fi
+										if [[ "$(cat $proc/cmdline | tr '\000' '\n' | head -n1 | tr '/' '\n' | tail -n1)" == "kubelet" ]]; then
+											echo $proc
+											return
+										fi
+									done
+								}
+								get_flexvolume_path() {
+									proc=$(find_kubelet_proc)
+									if [ "$proc" != "" ]; then
+										path=$(cat $proc/cmdline | tr '\000' '\n' | grep volume-plugin-dir | tr '=' '\n' | tail -n1)
+										if [ "$path" == "" ]; then
+											echo '/usr/libexec/kubernetes/kubelet-plugins/volume/exec/'
+										else
+											echo $path
+										fi
+										return
+									fi
+									echo 'no kubelet process found, dunno'
+								}
+								FLEXVOLUME_PATH=$(get_flexvolume_path)
+								wget -q -O - "${DISCOVER_FLEXVOLUME_DIR_SERVICE_HOST}:${DISCOVER_FLEXVOLUME_DIR_SERVICE_PORT}/${FLEXVOLUME_PATH}"
+								`},
+							SecurityContext: &v1.SecurityContext{
+								Privileged: &privilege,
+							},
+						},
+					},
+					RestartPolicy: v1.RestartPolicyNever,
+					HostPID:       true,
+				},
+			},
+		},
+	})
+
 	if err != nil {
-		return "", fmt.Errorf("Env %v wasn't set", types.EnvNodeName)
+		return "", err
 	}
-	uri := fmt.Sprintf("/api/v1/proxy/nodes/%s/configz", nodeName)
-	rawConfigInBytes, err := kubeClient.Core().RESTClient().Get().RequestURI(uri).DoRaw()
-	if err != nil {
-		return "", errors.Wrapf(err, "cannot reach node config URI %v", uri)
-	}
-	jsonParsed, err := gabs.ParseJSON(rawConfigInBytes)
-	if err != nil {
-		return "", errors.Wrapf(err, "cannot parse json")
-	}
-	value, ok := jsonParsed.Path("kubeletconfig.volumePluginDir").Data().(string)
-	if !ok {
-		logrus.Infof("cannot find volumePluginDir key in node config, assume it's default")
-		return DefaultFlexvolumeDir, nil
-	}
-	logrus.Infof("Discovered Flexvolume dir at: %v", value)
-	return value, nil
+
+	<-doneChan
+
+	return flexvolumeDir, nil
 }
 
 func startProvisioner(kubeClient *clientset.Clientset, managerURL string, stopCh <-chan struct{}) error {
