@@ -439,6 +439,35 @@ func discoverFlexvolumeDir(kubeClient *clientset.Clientset) (dir string, err err
 		},
 	})
 
+	detectFlexVolumeScript := `
+		find_kubelet_proc() {
+			for proc in $(find /proc -type d -maxdepth 1); do
+				if [ ! -f $proc/cmdline ]; then
+					continue
+				fi
+				if [[ "$(cat $proc/cmdline | tr '\000' '\n' | head -n1 | tr '/' '\n' | tail -n1)" == "kubelet" ]]; then
+					echo $proc
+					return
+				fi
+			done
+		}
+		get_flexvolume_path() {
+			proc=$(find_kubelet_proc)
+			if [ "$proc" != "" ]; then
+				path=$(cat $proc/cmdline | tr '\000' '\n' | grep volume-plugin-dir | tr '=' '\n' | tail -n1)
+				if [ "$path" == "" ]; then
+					echo '/usr/libexec/kubernetes/kubelet-plugins/volume/exec/'
+				else
+					echo $path
+				fi
+				return
+			fi
+			echo 'no kubelet process found, dunno'
+		}
+		FLEXVOLUME_PATH=$(get_flexvolume_path)
+		wget -q -O - "${DISCOVER_FLEXVOLUME_DIR_SERVICE_HOST}:${DISCOVER_FLEXVOLUME_DIR_SERVICE_PORT}/${FLEXVOLUME_PATH}"
+	`
+
 	// create job that will send results to our server
 	privilege := true
 	_, err = kubeClient.BatchV1().Jobs(namespace).Create(&batchv1.Job{
@@ -452,35 +481,7 @@ func discoverFlexvolumeDir(kubeClient *clientset.Clientset) (dir string, err err
 							Name:    objectMeta.Name,
 							Image:   "busybox",
 							Command: []string{"/bin/sh"},
-							Args: []string{"-c",
-								`
-								find_kubelet_proc() {
-									for proc in $(find /proc -type d -maxdepth 1); do
-										if [ ! -f $proc/cmdline ]; then
-											continue
-										fi
-										if [[ "$(cat $proc/cmdline | tr '\000' '\n' | head -n1 | tr '/' '\n' | tail -n1)" == "kubelet" ]]; then
-											echo $proc
-											return
-										fi
-									done
-								}
-								get_flexvolume_path() {
-									proc=$(find_kubelet_proc)
-									if [ "$proc" != "" ]; then
-										path=$(cat $proc/cmdline | tr '\000' '\n' | grep volume-plugin-dir | tr '=' '\n' | tail -n1)
-										if [ "$path" == "" ]; then
-											echo '/usr/libexec/kubernetes/kubelet-plugins/volume/exec/'
-										else
-											echo $path
-										fi
-										return
-									fi
-									echo 'no kubelet process found, dunno'
-								}
-								FLEXVOLUME_PATH=$(get_flexvolume_path)
-								wget -q -O - "${DISCOVER_FLEXVOLUME_DIR_SERVICE_HOST}:${DISCOVER_FLEXVOLUME_DIR_SERVICE_PORT}/${FLEXVOLUME_PATH}"
-								`},
+							Args:    []string{"-c", detectFlexVolumeScript},
 							SecurityContext: &v1.SecurityContext{
 								Privileged: &privilege,
 							},
